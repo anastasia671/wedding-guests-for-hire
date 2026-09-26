@@ -55,6 +55,23 @@ create table expenses (
   notification_status delivery_state not null default 'not_required'
 );
 
+-- The browser never talks to these tables directly. RLS remains enabled, while
+-- the server's service_role credential can operate the application API.
+alter table public.employees enable row level security;
+alter table public.sales enable row level security;
+alter table public.expenses enable row level security;
+
+grant usage on schema public to service_role;
+grant select, insert, update, delete on table public.employees, public.sales, public.expenses to service_role;
+
+drop policy if exists "service_role_employees" on public.employees;
+drop policy if exists "service_role_sales" on public.sales;
+drop policy if exists "service_role_expenses" on public.expenses;
+
+create policy "service_role_employees" on public.employees for all to service_role using (true) with check (true);
+create policy "service_role_sales" on public.sales for all to service_role using (true) with check (true);
+create policy "service_role_expenses" on public.expenses for all to service_role using (true) with check (true);
+
 -- Run once after schema creation. These UUIDs are intentionally stable for the demo-role selector.
 insert into employees (id, name, role) values
   ('00000000-0000-4000-8000-000000000001', 'Richard Darling', 'salesperson'),
