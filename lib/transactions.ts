@@ -30,7 +30,12 @@ async function syncExpense(record: any) {
 async function recordSync(table: "sales" | "expenses", reference: string, sync: () => Promise<void>) {
   const db = adminDb();
   try { await sync(); await db.from(table).update({ sync_status: "synced" }).eq("reference", reference); return "synced"; }
-  catch { await db.from(table).update({ sync_status: "failed" }).eq("reference", reference); return "failed"; }
+  catch (error) {
+    // Keep secrets out of the UI, but record the provider's message in server logs for safe troubleshooting.
+    console.error(`Google Sheets sync failed for ${table} ${reference}:`, error instanceof Error ? error.message : error);
+    await db.from(table).update({ sync_status: "failed" }).eq("reference", reference);
+    return "failed";
+  }
 }
 
 export async function submitSale(actorId: string, input: { reference: string; customer: string; project: "A" | "B"; description: string; amount: number; split: Split }, chatId?: number) {
