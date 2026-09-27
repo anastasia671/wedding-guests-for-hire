@@ -29,12 +29,12 @@ async function syncExpense(record: any) {
 
 async function recordSync(table: "sales" | "expenses", reference: string, sync: () => Promise<void>) {
   const db = adminDb();
-  try { await sync(); await db.from(table).update({ sync_status: "synced" }).eq("reference", reference); return "synced"; }
+  try { await sync(); await db.from(table).update({ sync_status: "synced" }).eq("reference", reference); return { syncStatus: "synced" as const }; }
   catch (error) {
     // Keep secrets out of the UI, but record the provider's message in server logs for safe troubleshooting.
     console.error(`Google Sheets sync failed for ${table} ${reference}:`, error instanceof Error ? error.message : error);
     await db.from(table).update({ sync_status: "failed" }).eq("reference", reference);
-    return "failed";
+    return { syncStatus: "failed" as const, syncError: error instanceof Error ? error.message : "Google Sheets did not accept the update." };
   }
 }
 
@@ -44,8 +44,8 @@ export async function submitSale(actorId: string, input: { reference: string; cu
   const db = adminDb();
   const { data, error } = await db.from("sales").insert({ reference: input.reference, submitted_by: actor.id, telegram_chat_id: chatId ?? actor.telegram_chat_id, customer: input.customer, project: input.project, description: input.description, amount_cents: cents(input.amount), proposed_richard: input.split.richard, proposed_anastasia: input.split.anastasia, proposed_jean_claude: input.split.jeanClaude }).select("*, submitter:employees!submitted_by(name)").single();
   if (error) throw new Error(error.code === "23505" ? "That reference already exists." : error.message);
-  const syncStatus = await recordSync("sales", input.reference, () => syncSale(data));
-  return { reference: input.reference, status: "pending", syncStatus };
+  const sync = await recordSync("sales", input.reference, () => syncSale(data));
+  return { reference: input.reference, status: "pending", ...sync };
 }
 
 export async function submitExpense(actorId: string, input: { reference: string; description: string; category: "Materials" | "Travel" | "Other"; amount: number; proposedAllocation: Allocation }, chatId?: number) {
@@ -55,8 +55,8 @@ export async function submitExpense(actorId: string, input: { reference: string;
   const db = adminDb();
   const { data, error } = await db.from("expenses").insert({ reference: input.reference, submitted_by: actor.id, telegram_chat_id: chatId ?? actor.telegram_chat_id, description: input.description, category: input.category, amount_cents: cents(input.amount), proposed_allocation: input.proposedAllocation, final_allocation: overhead ? "overhead" : null, status: overhead ? "allocated" : "awaiting_allocation" }).select("*, submitter:employees!submitted_by(name)").single();
   if (error) throw new Error(error.code === "23505" ? "That reference already exists." : error.message);
-  const syncStatus = await recordSync("expenses", input.reference, () => syncExpense(data));
-  return { reference: input.reference, status: overhead ? "allocated" : "awaiting allocation", syncStatus };
+  const sync = await recordSync("expenses", input.reference, () => syncExpense(data));
+  return { reference: input.reference, status: overhead ? "allocated" : "awaiting allocation", ...sync };
 }
 
 export async function approveSale(actorId: string, reference: string, finalSplit: Split) {
@@ -65,7 +65,7 @@ export async function approveSale(actorId: string, reference: string, finalSplit
   if (error || !old) throw new Error("Sale not found."); if (old.status === "approved") return { unchanged: true, reference };
   const { data, error: updateError } = await db.from("sales").update({ approved_richard: finalSplit.richard, approved_anastasia: finalSplit.anastasia, approved_jean_claude: finalSplit.jeanClaude, status: "approved", notification_status: old.telegram_chat_id ? "pending" : "not_required" }).eq("reference", reference).select("*, submitter:employees!submitted_by(name)").single();
   if (updateError) throw new Error(updateError.message);
-  const syncStatus = await recordSync("sales", reference, () => syncSale(data));
+  const sync = await recordSync("sales", reference, () => syncSale(data));
   let notificationStatus = data.notification_status;
   if (data.telegram_chat_id) {
     const commission = commissionForSale(data.amount_cents, finalSplit); const changed = ["richard", "anastasia", "jeanClaude"].some((key) => Number(data[`proposed_${key === "jeanClaude" ? "jean_claude" : key}`]) !== finalSplit[key as keyof Split]);
@@ -73,7 +73,7 @@ export async function approveSale(actorId: string, reference: string, finalSplit
     catch { notificationStatus = "failed"; }
     await db.from("sales").update({ notification_status: notificationStatus }).eq("reference", reference);
   }
-  return { reference, syncStatus, notificationStatus };
+  return { reference, ...sync, notificationStatus };
 }
 
 export async function approveExpense(actorId: string, reference: string, finalAllocation: Allocation) {
@@ -82,21 +82,21 @@ export async function approveExpense(actorId: string, reference: string, finalAl
   if (error || !old) throw new Error("Expense not found."); if (old.status === "allocated") return { unchanged: true, reference };
   const { data, error: updateError } = await db.from("expenses").update({ final_allocation: finalAllocation, status: "allocated", notification_status: old.telegram_chat_id ? "pending" : "not_required" }).eq("reference", reference).select("*, submitter:employees!submitted_by(name)").single();
   if (updateError) throw new Error(updateError.message);
-  const syncStatus = await recordSync("expenses", reference, () => syncExpense(data));
+  const sync = await recordSync("expenses", reference, () => syncExpense(data));
   let notificationStatus = data.notification_status;
   if (data.telegram_chat_id) {
     try { await sendTelegram(data.telegram_chat_id, `Expense ${reference} ${data.proposed_allocation === finalAllocation ? "allocation confirmed" : "allocation changed"}. €${(data.amount_cents / 100).toFixed(2)}: ${data.description}. Proposed: ${data.proposed_allocation}. Approved: ${finalAllocation}.`); notificationStatus = "sent"; }
     catch { notificationStatus = "failed"; }
     await db.from("expenses").update({ notification_status: notificationStatus }).eq("reference", reference);
   }
-  return { reference, syncStatus, notificationStatus };
+  return { reference, ...sync, notificationStatus };
 }
 
 export async function retrySync(actorId: string, kind: "sale" | "expense", reference: string) {
   const actor = await actorFromId(actorId); if (actor.role !== "manager") throw new Error("Only Svetlana can retry synchronization.");
   const table = kind === "sale" ? "sales" : "expenses"; const { data, error } = await adminDb().from(table).select("*, submitter:employees!submitted_by(name)").eq("reference", reference).single();
   if (error || !data) throw new Error("Transaction not found.");
-  return { reference, syncStatus: await recordSync(table, reference, () => kind === "sale" ? syncSale(data) : syncExpense(data)) };
+  return { reference, ...(await recordSync(table, reference, () => kind === "sale" ? syncSale(data) : syncExpense(data))) };
 }
 
 export async function retryNotification(actorId: string, kind: "sale" | "expense", reference: string) {
