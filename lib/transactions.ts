@@ -13,6 +13,19 @@ export async function actorFromId(id: string): Promise<Actor> {
 
 const splitValues = (split: Split) => [split.richard, split.anastasia, split.jeanClaude];
 
+/**
+ * Telegram submissions always keep their original chat. Website records may be
+ * created before the employee starts the bot, so resolve that employee's
+ * currently linked private chat at the moment a decision is made. Once found,
+ * it is stored on the record so a later role re-link cannot redirect it.
+ */
+async function notificationChatId(record: { telegram_chat_id: number | null; submitted_by: string }) {
+  if (record.telegram_chat_id) return record.telegram_chat_id;
+  const { data, error } = await adminDb().from("employees").select("telegram_chat_id").eq("id", record.submitted_by).single();
+  if (error) throw new Error(error.message);
+  return data?.telegram_chat_id ?? null;
+}
+
 async function syncSale(record: any) {
   await upsertSheetRow("Sales", record.reference, [record.reference, record.submitted_at, record.submitter?.name ?? "", record.customer, record.project, record.description, record.amount_cents / 100,
     `${record.proposed_richard}/${record.proposed_anastasia}/${record.proposed_jean_claude}`, record.status === "approved" ? `${record.approved_richard}/${record.approved_anastasia}/${record.approved_jean_claude}` : "",
@@ -63,13 +76,14 @@ export async function approveSale(actorId: string, reference: string, finalSplit
   const actor = await actorFromId(actorId); if (actor.role !== "manager") throw new Error("Only Svetlana can approve sales.");
   const db = adminDb(); const { data: old, error } = await db.from("sales").select("*, submitter:employees!submitted_by(name)").eq("reference", reference).single();
   if (error || !old) throw new Error("Sale not found."); if (old.status === "approved") return { unchanged: true, reference };
-  const { data, error: updateError } = await db.from("sales").update({ approved_richard: finalSplit.richard, approved_anastasia: finalSplit.anastasia, approved_jean_claude: finalSplit.jeanClaude, status: "approved", notification_status: old.telegram_chat_id ? "pending" : "not_required" }).eq("reference", reference).select("*, submitter:employees!submitted_by(name)").single();
+  const chatId = await notificationChatId(old);
+  const { data, error: updateError } = await db.from("sales").update({ approved_richard: finalSplit.richard, approved_anastasia: finalSplit.anastasia, approved_jean_claude: finalSplit.jeanClaude, status: "approved", telegram_chat_id: old.telegram_chat_id ?? chatId, notification_status: chatId ? "pending" : "not_required" }).eq("reference", reference).select("*, submitter:employees!submitted_by(name)").single();
   if (updateError) throw new Error(updateError.message);
   const sync = await recordSync("sales", reference, () => syncSale(data));
   let notificationStatus = data.notification_status;
-  if (data.telegram_chat_id) {
+  if (chatId) {
     const commission = commissionForSale(data.amount_cents, finalSplit); const changed = ["richard", "anastasia", "jeanClaude"].some((key) => Number(data[`proposed_${key === "jeanClaude" ? "jean_claude" : key}`]) !== finalSplit[key as keyof Split]);
-    try { await sendTelegram(data.telegram_chat_id, `Sale ${reference} approved${changed ? " — commission split changed" : ""}. Sale €${(data.amount_cents / 100).toFixed(2)}; total commission €${(commission.poolCents / 100).toFixed(2)}. Richard: ${finalSplit.richard}% (€${(commission.earnings.richard / 100).toFixed(2)}). Anastasia: ${finalSplit.anastasia}% (€${(commission.earnings.anastasia / 100).toFixed(2)}). Jean-Claude: ${finalSplit.jeanClaude}% (€${(commission.earnings.jeanClaude / 100).toFixed(2)}).`); notificationStatus = "sent"; }
+    try { await sendTelegram(chatId, `Sale ${reference} approved${changed ? " — commission split changed" : ""}. Sale €${(data.amount_cents / 100).toFixed(2)}; total commission €${(commission.poolCents / 100).toFixed(2)}. Richard: ${finalSplit.richard}% (€${(commission.earnings.richard / 100).toFixed(2)}). Anastasia: ${finalSplit.anastasia}% (€${(commission.earnings.anastasia / 100).toFixed(2)}). Jean-Claude: ${finalSplit.jeanClaude}% (€${(commission.earnings.jeanClaude / 100).toFixed(2)}).`); notificationStatus = "sent"; }
     catch { notificationStatus = "failed"; }
     await db.from("sales").update({ notification_status: notificationStatus }).eq("reference", reference);
   }
@@ -80,12 +94,13 @@ export async function approveExpense(actorId: string, reference: string, finalAl
   const actor = await actorFromId(actorId); if (actor.role !== "manager") throw new Error("Only Svetlana can allocate expenses.");
   const db = adminDb(); const { data: old, error } = await db.from("expenses").select("*, submitter:employees!submitted_by(name)").eq("reference", reference).single();
   if (error || !old) throw new Error("Expense not found."); if (old.status === "allocated") return { unchanged: true, reference };
-  const { data, error: updateError } = await db.from("expenses").update({ final_allocation: finalAllocation, status: "allocated", notification_status: old.telegram_chat_id ? "pending" : "not_required" }).eq("reference", reference).select("*, submitter:employees!submitted_by(name)").single();
+  const chatId = await notificationChatId(old);
+  const { data, error: updateError } = await db.from("expenses").update({ final_allocation: finalAllocation, status: "allocated", telegram_chat_id: old.telegram_chat_id ?? chatId, notification_status: chatId ? "pending" : "not_required" }).eq("reference", reference).select("*, submitter:employees!submitted_by(name)").single();
   if (updateError) throw new Error(updateError.message);
   const sync = await recordSync("expenses", reference, () => syncExpense(data));
   let notificationStatus = data.notification_status;
-  if (data.telegram_chat_id) {
-    try { await sendTelegram(data.telegram_chat_id, `Expense ${reference} ${data.proposed_allocation === finalAllocation ? "allocation confirmed" : "allocation changed"}. €${(data.amount_cents / 100).toFixed(2)}: ${data.description}. Proposed: ${data.proposed_allocation}. Approved: ${finalAllocation}.`); notificationStatus = "sent"; }
+  if (chatId) {
+    try { await sendTelegram(chatId, `Expense ${reference} ${data.proposed_allocation === finalAllocation ? "allocation confirmed" : "allocation changed"}. €${(data.amount_cents / 100).toFixed(2)}: ${data.description}. Proposed: ${data.proposed_allocation}. Approved: ${finalAllocation}.`); notificationStatus = "sent"; }
     catch { notificationStatus = "failed"; }
     await db.from("expenses").update({ notification_status: notificationStatus }).eq("reference", reference);
   }
@@ -103,10 +118,12 @@ export async function retryNotification(actorId: string, kind: "sale" | "expense
   const actor = await actorFromId(actorId); if (actor.role !== "manager") throw new Error("Only Svetlana can retry notifications.");
   const table = kind === "sale" ? "sales" : "expenses"; const db = adminDb();
   const { data, error } = await db.from(table).select("*").eq("reference", reference).single();
-  if (error || !data) throw new Error("Transaction not found."); if (!data.telegram_chat_id) throw new Error("No Telegram recipient linked.");
+  if (error || !data) throw new Error("Transaction not found.");
+  const chatId = await notificationChatId(data);
+  if (!chatId) throw new Error("No Telegram recipient linked. Link the employee and have them start the bot, then retry.");
   try {
-    if (kind === "sale") { const split = { richard: Number(data.approved_richard), anastasia: Number(data.approved_anastasia), jeanClaude: Number(data.approved_jean_claude) }; const earned = commissionForSale(data.amount_cents, split); await sendTelegram(data.telegram_chat_id, `Sale ${reference} approved. Sale €${(data.amount_cents / 100).toFixed(2)}; total commission €${(earned.poolCents / 100).toFixed(2)}. Richard: ${split.richard}% (€${(earned.earnings.richard / 100).toFixed(2)}). Anastasia: ${split.anastasia}% (€${(earned.earnings.anastasia / 100).toFixed(2)}). Jean-Claude: ${split.jeanClaude}% (€${(earned.earnings.jeanClaude / 100).toFixed(2)}).`); }
-    else await sendTelegram(data.telegram_chat_id, `Expense ${reference} allocation confirmed. €${(data.amount_cents / 100).toFixed(2)}: ${data.description}. Proposed: ${data.proposed_allocation}. Approved: ${data.final_allocation}.`);
-    await db.from(table).update({ notification_status: "sent" }).eq("reference", reference); return { reference, notificationStatus: "sent" };
-  } catch { await db.from(table).update({ notification_status: "failed" }).eq("reference", reference); return { reference, notificationStatus: "failed" }; }
+    if (kind === "sale") { const split = { richard: Number(data.approved_richard), anastasia: Number(data.approved_anastasia), jeanClaude: Number(data.approved_jean_claude) }; const earned = commissionForSale(data.amount_cents, split); const changed = Number(data.proposed_richard) !== split.richard || Number(data.proposed_anastasia) !== split.anastasia || Number(data.proposed_jean_claude) !== split.jeanClaude; await sendTelegram(chatId, `Sale ${reference} approved${changed ? " — commission split changed" : ""}. Sale €${(data.amount_cents / 100).toFixed(2)}; total commission €${(earned.poolCents / 100).toFixed(2)}. Richard: ${split.richard}% (€${(earned.earnings.richard / 100).toFixed(2)}). Anastasia: ${split.anastasia}% (€${(earned.earnings.anastasia / 100).toFixed(2)}). Jean-Claude: ${split.jeanClaude}% (€${(earned.earnings.jeanClaude / 100).toFixed(2)}).`); }
+    else await sendTelegram(chatId, `Expense ${reference} ${data.proposed_allocation === data.final_allocation ? "allocation confirmed" : "allocation changed"}. €${(data.amount_cents / 100).toFixed(2)}: ${data.description}. Proposed: ${data.proposed_allocation}. Approved: ${data.final_allocation}.`);
+    await db.from(table).update({ telegram_chat_id: data.telegram_chat_id ?? chatId, notification_status: "sent" }).eq("reference", reference); return { reference, notificationStatus: "sent" };
+  } catch { await db.from(table).update({ telegram_chat_id: data.telegram_chat_id ?? chatId, notification_status: "failed" }).eq("reference", reference); return { reference, notificationStatus: "failed" }; }
 }
