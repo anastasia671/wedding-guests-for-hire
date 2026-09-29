@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { adminDb } from "@/lib/supabase";
 
 export async function GET() {
-  const { data, error } = await adminDb().from("employees").select("id,name,role,telegram_user_id,telegram_chat_id").order("name");
+  // IDs are all the demonstration selector needs. Telegram identifiers stay
+  // server-only, alongside the bot token and database credentials.
+  const { data, error } = await adminDb().from("employees").select("id,name,role").order("name");
   return NextResponse.json(error ? { error: error.message } : { employees: data }, { status: error ? 500 : 200 });
 }
