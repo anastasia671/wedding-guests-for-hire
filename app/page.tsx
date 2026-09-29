@@ -3,7 +3,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { money } from "@/lib/domain";
 
-type Employee = { id: string; name: string; role: string; telegram_user_id: number | null; telegram_chat_id: number | null };
+type Employee = { id: string; name: string; role: string };
 type Overview = any;
 const request = async (url: string, body?: unknown) => {
   const response = await fetch(url, body ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : undefined);
@@ -13,8 +13,17 @@ const request = async (url: string, body?: unknown) => {
 export default function Home() {
   const [overview, setOverview] = useState<Overview | null>(null); const [employees, setEmployees] = useState<Employee[]>([]); const [actorId, setActorId] = useState(""); const [notice, setNotice] = useState(""); const [telegramUserId, setTelegramUserId] = useState("");
   const actor = useMemo(() => employees.find((person) => person.id === actorId), [employees, actorId]);
-  const load = async () => { try { const [people, data] = await Promise.all([fetch("/api/employees").then((r) => r.json()), fetch("/api/overview").then((r) => r.json())]); if (people.error) throw new Error(people.error); if (data.error) throw new Error(data.error); setEmployees(people.employees); setOverview(data); if (!actorId) setActorId(people.employees[0]?.id ?? ""); } catch (error) { setNotice(error instanceof Error ? error.message : "Could not load data."); } };
+  const load = async (requestedActorId = actorId) => { try {
+    const people = employees.length ? { employees } : await fetch("/api/employees").then((r) => r.json());
+    if (people.error) throw new Error(people.error);
+    const resolvedActorId = requestedActorId || people.employees[0]?.id;
+    if (!resolvedActorId) throw new Error("No demonstration employees are configured.");
+    const data = await fetch(`/api/overview?actorId=${encodeURIComponent(resolvedActorId)}`).then((r) => r.json());
+    if (data.error) throw new Error(data.error);
+    setEmployees(people.employees); setOverview(data); if (!actorId) setActorId(resolvedActorId);
+  } catch (error) { setNotice(error instanceof Error ? error.message : "Could not load data."); } };
   useEffect(() => { void load(); }, []);
+  useEffect(() => { if (actorId) void load(actorId); }, [actorId]);
   const syncMessage = (result: any) => `Sheets: ${result.syncStatus}.${result.syncError ? ` Error: ${result.syncError}` : ""}`;
   const submit = async (event: FormEvent<HTMLFormElement>, kind: "sale" | "expense") => { event.preventDefault(); const formElement = event.currentTarget; const form = new FormData(formElement); const number = (name: string) => Number(form.get(name)); const data = kind === "sale" ? { reference: form.get("reference"), customer: form.get("customer"), project: form.get("project"), description: form.get("description"), amount: number("amount"), split: { richard: number("richard"), anastasia: number("anastasia"), jeanClaude: number("jeanClaude") } } : { reference: form.get("reference"), description: form.get("description"), category: form.get("category"), amount: number("amount"), proposedAllocation: form.get("allocation") }; try { const result = await request("/api/transactions", { actorId, kind, data }); setNotice(`${result.reference} saved. Status: ${result.status}; ${syncMessage(result)}`); formElement.reset(); await load(); } catch (error) { setNotice(error instanceof Error ? error.message : "Submission failed."); } };
   const decision = async (body: object) => { try { const result = await request("/api/decisions", { actorId, ...body }); setNotice(result.unchanged ? `${result.reference} was already approved; totals were not changed.` : `${result.reference} updated. ${syncMessage(result)} Telegram: ${result.notificationStatus ?? "not required"}.`); await load(); } catch (error) { setNotice(error instanceof Error ? error.message : "Action failed."); } };
@@ -29,7 +38,7 @@ export default function Home() {
       <form onSubmit={(e) => submit(e, "expense")}><h2>Submit an expense</h2><p>For Kevin only.</p><Field name="reference" label="Reference" placeholder="E01" /><Field name="description" label="Description" /><label>Category<select name="category"><option>Materials</option><option>Travel</option><option>Other</option></select></label><Field name="amount" label="Amount in euros" type="number" step="0.01" /><label>Proposed allocation<select name="allocation"><option value="A">Project A</option><option value="B">Project B</option><option value="overhead">Company overhead</option></select></label><button>Save expense</button></form>
     </section>
     {actor?.role === "manager" && <section className="manager"><h2>Manager controls — Svetlana</h2><p>Corrections are allowed before approval. Repeating an approval does not duplicate a record or change totals.</p><div className="grid"><PendingSales records={overview?.sales?.filter((sale: any) => sale.status === "pending") ?? []} decide={decision} /><PendingExpenses records={overview?.expenses?.filter((expense: any) => expense.status === "awaiting_allocation") ?? []} decide={decision} /></div><form className="link-form" onSubmit={linkTelegram}><h3>Manager setup — link Telegram user ID</h3><label>Employee<select name="employeeId">{employees.map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select></label><label>Telegram user ID<input required value={telegramUserId} onChange={(e) => setTelegramUserId(e.target.value)} inputMode="numeric" /></label><button>Link account</button></form></section>}
-    {actor?.role === "manager" ? <Dashboard data={overview} onRetry={(kind: "sale" | "expense", reference: string) => decision({ action: "retry-sync", kind, reference })} onRetryNotification={(kind: "sale" | "expense", reference: string) => decision({ action: "retry-notification", kind, reference })} /> : <MySubmissions records={overview ? [...overview.sales, ...overview.expenses].filter((record: any) => record.submitted_by === actorId) : []} />}
+    {actor?.role === "manager" ? <Dashboard data={overview} onRetry={(kind: "sale" | "expense", reference: string) => decision({ action: "retry-sync", kind, reference })} onRetryNotification={(kind: "sale" | "expense", reference: string) => decision({ action: "retry-notification", kind, reference })} /> : <MySubmissions records={overview ? [...overview.sales, ...overview.expenses] : []} />}
     <section className="instructions"><h2>How to use</h2><p>Choose a demonstration role to test the role permissions. Salespeople and Kevin see only their own submissions and statuses; Svetlana sees the manager controls, all transactions, and the financial dashboard. For the actual Telegram test, link your Telegram user ID to Richard or Kevin, start the bot in a private chat, then use <code>/sale</code> or <code>/expense</code> in the format described by the bot.</p></section>
   </main>;
 }
